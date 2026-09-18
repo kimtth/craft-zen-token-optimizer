@@ -24,7 +24,7 @@ SOURCE = (
 )
 CANDIDATE = "Report the result; never disclose secrets."
 REPAIRED = "State the result concisely; keep secrets private."
-STAGES = ("REWRITE", "REPAIR", "REVIEW", "CASES", "PAIR", "FINAL")
+STAGES = ("REWRITE", "REPAIR", "REVIEW", "CASES", "AUDIT", "PAIR", "FINAL")
 
 
 def _review(
@@ -67,6 +67,22 @@ def _answer(text: str = "The result is complete.") -> str:
     return f"[[ ## answer ## ]]\n{text}\n[[ ## completed ## ]]"
 
 
+def _audit(_system: str, user: str) -> dict:
+    payload = json.loads(user)
+    payload = payload.get("request", payload)
+    return {
+        "requirements": [{
+            "id": "r1", "requirement": "Preserve the source behavior.",
+            "source_quote": payload["source"], "text_verifiable": True,
+            "rationale": "This scripted fixture tests final response text.",
+            "links": [{"phase": phase, "case_id": case["id"],
+                       "rationale": "The scripted scenario and criteria exercise the rule."}
+                      for phase in ("validation", "holdout") for case in payload["cases"][phase]],
+        }],
+        "unsupported_criteria": [],
+    }
+
+
 def _final(_system: str, user: str) -> dict:
     """Conservative scripted default; tests explicitly opt into justified confirmation."""
     payload = json.loads(user)
@@ -107,6 +123,7 @@ class Script:
             "REPAIR": {"body": REPAIRED},
             "REVIEW": _review(),
             "CASES": _cases(self.case_count),
+            "AUDIT": _audit,
             "PAIR": _pair(),
             "TASK": _answer(),
             "FINAL": _final,
@@ -494,7 +511,7 @@ def test_cases_use_source_only_and_target_never_sees_case_grading_criteria(tmp_p
                    for stage, system, user in harness.script.calls if stage in ("REWRITE", "REPAIR"))
 
 
-@pytest.mark.parametrize("stage", ["REWRITE", "REVIEW", "CASES", "PAIR"])
+@pytest.mark.parametrize("stage", ["REWRITE", "REVIEW", "CASES", "AUDIT", "PAIR"])
 def test_structured_stages_allow_one_schema_repair_retry(tmp_path: Path, stage: str) -> None:
     harness = _make(tmp_path, responses={stage: ["INVALID_SCHEMA_SENTINEL"]})
     result = harness.run()
@@ -538,7 +555,7 @@ def test_initial_generation_schema_failure_is_error_with_report_and_no_draft(
     assert _manifest(harness)["optimized"] is None
 
 
-@pytest.mark.parametrize("stage", ["REWRITE", "REVIEW", "REPAIR", "CASES", "PAIR"])
+@pytest.mark.parametrize("stage", ["REWRITE", "REVIEW", "REPAIR", "CASES", "AUDIT", "PAIR"])
 def test_provider_errors_are_not_retried_and_raw_error_is_journaled(
     tmp_path: Path, stage: str,
 ) -> None:
@@ -578,7 +595,7 @@ def test_direct_review_schema_failure_does_not_discard_successful_pair_evidence(
     assert result.details["errors"]
 
 
-@pytest.mark.parametrize("stage", ["REPAIR", "CASES", "PAIR"])
+@pytest.mark.parametrize("stage", ["REPAIR", "CASES", "AUDIT", "PAIR"])
 def test_exhausted_schema_retries_retain_prior_drafts(tmp_path: Path, stage: str) -> None:
     responses = {stage: ["bad first response", "bad second response"]}
     if stage == "REPAIR":

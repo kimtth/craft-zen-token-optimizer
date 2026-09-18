@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from ..domain.core import OptimizationResult
 from .report import without_report_paths
+from .semantic_coverage import report_lines
 
 
 def digest(data: bytes) -> str:
@@ -142,6 +143,7 @@ def render_semantic_report(result: OptimizationResult) -> str:
         lines.append("")
     if not details["reviews"]:
         lines.append("No complete instruction review.")
+    lines.extend(report_lines(details.get("case_audit", {})))
     lines.extend(["", "## Paired task comparisons", ""])
     for phase, evidence in details["phases"].items():
         pairs = evidence["pairs"]
