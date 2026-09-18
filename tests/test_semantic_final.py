@@ -59,7 +59,7 @@ def test_shared_baseline_defect_can_be_confirmed_without_rewriting(tmp_path):
     assert result.details["reasons"] == []
     assert result.details["errors"] == []
     assert harness.script.counts["FINAL"] == 1
-    assert result.calls == 16
+    assert result.calls == 17
     assert result.details["budget"]["used"] == result.calls
     assert [stage for stage, _, _ in harness.script.calls][-1] == "FINAL"
     assert harness.script.counts["REWRITE"] == 1
@@ -196,7 +196,7 @@ def test_no_final_review_when_initial_checks_pass(tmp_path):
     assert harness.script.counts["FINAL"] == 0
 
 
-@pytest.mark.parametrize("budget,expected_calls", [(15, 0), (16, 1)])
+@pytest.mark.parametrize("budget,expected_calls", [(16, 0), (17, 1)])
 def test_final_review_respects_remaining_shared_budget(tmp_path, budget, expected_calls):
     harness = _harness(tmp_path, budget=budget, responses={"FINAL": ["malformed", _confirm]})
     result = harness.run()
@@ -212,7 +212,7 @@ def test_final_schema_retry_can_succeed(tmp_path):
     result = harness.run()
     assert result.decision == "CONFIRMED"
     assert harness.script.counts["FINAL"] == 2
-    assert result.calls == 17
+    assert result.calls == 18
 
 
 def test_final_provider_failure_is_not_retried(tmp_path):

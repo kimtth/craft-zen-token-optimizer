@@ -23,6 +23,7 @@ from ..runtime.progress import ProgressCallback
 from . import semantic_checks as checks
 from .proposer import validate_focus
 from .semantic_adjudication import FINAL, evidence_bundle, validate_final
+from .semantic_coverage import AUDIT, validate_audit
 from .semantic_outputs import (
     atomic_bytes,
     atomic_json,
@@ -83,6 +84,7 @@ class SemanticOptimizer:
                 "output_directory": str((self.config.output_dir or self.artifact.path.parent).resolve()),
                 "phase": "rewrite", "errors": [], "reviews": [], "reasons": [],
                 "final_review": {"status": "NOT_RUN", "reason": "Evaluation is pending."},
+                "case_audit": {"status": "NOT_RUN", "reason": "Source-based cases are pending."},
                 "publications": [], "budget": {"limit": self.budget.limit, "used": self.budget.calls},
                 "artifacts": {"draft": None, "optimized": None, "run_draft": None,
                               "run_optimized": None, "drafts": []},
@@ -217,6 +219,17 @@ class SemanticOptimizer:
             return
         self.cases = cases
         atomic_json(self.root / "cases.json", cases)
+        self._stage("source-based case audit", 33)
+        audit = self._structured(self.strong, AUDIT, {
+            "source": self.artifact.body, "cases": cases,
+        }, lambda value: validate_audit(value, self.artifact.body, cases))
+        self.details["case_audit"] = audit or {
+            "status": "ERROR", "reason": "Case audit is incomplete; see recorded errors.",
+        }
+        atomic_json(self.root / "case-audit.json", self.details["case_audit"])
+        save_summary(self.result)
+        if audit is None:
+            return
         for phase, start in (("validation", 35), ("holdout", 65)):
             for index, case in enumerate(cases[phase]):
                 self._stage(f"{phase} {index + 1}/{count}", start + round(25 * index / count))

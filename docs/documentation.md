@@ -6,6 +6,43 @@ engine; GEPA search is available explicitly. "Dataset-free" means no user-suppli
 Zen generates its own evaluation cases. See [README.md](../README.md#install-and-verify)
 for installation, Copilot runtime setup, and authentication.
 
+## Why dataset-free
+
+Most instruction- or prompt-compression tools need one of two things to decide whether
+a shorter version is still correct: a labeled dataset of known-good outputs, or a
+hand-written reward/scoring function. Neither exists for a Copilot customization
+artifact — there is no ground-truth corpus of "correct" agent answers for an arbitrary
+`AGENTS.md` or `SKILL.md`.
+
+Zen generates its own evaluation cases from the artifact's own text and asks a model
+for a **relative** judgment: does a candidate's answer preserve the same obligations,
+facts, and constraints as the original's answer to the same request? This is the same
+core insight behind
+[RULER (Relative Universal LLM-Elicited Rewards)](https://blog.dailydoseofds.com/p/how-to-fine-tune-llms-in-2026-bf8),
+which influenced Zen's design: asking a model to score one output on an absolute scale
+("rate this 0-10") is unreliable, while asking it to compare a small set of attempts
+against each other is far more consistent — and needs no labeled data or engineered
+reward function. RULER applies that idea to reinforcement-learning rewards for agents;
+Zen applies the same relative, dataset-free comparison to instruction-optimization
+verification, comparing an original answer against a candidate answer for the same
+case rather than scoring either one in isolation.
+
+This is also why Zen ships two engines under one dataset-free contract instead of a
+single fixed heuristic:
+
+- **Semantic (default)** trades search breadth for a small, bounded call budget
+  (32 calls) and a single rewrite plus limited repair — a safe, low-cost default that
+  verifies with relative comparisons instead of an open-ended search.
+- **GEPA (opt-in)** trades budget (600 calls by default) for a real search: it proposes
+  many candidate removals/rewrites and uses train/validation feedback to pick better
+  ones, still judged with the same relative, source-grounded comparisons and separate
+  held-out evidence.
+
+Both engines require the same evidence before accepting a result: complete validation
+and holdout comparisons, no observed material behavior loss, and a measured token
+reduction. Dataset-free removes the labeling burden; it does not remove the
+requirement to prove equivalence before publishing.
+
 ## Supported input
 
 Each run accepts one UTF-8 Markdown artifact with a nonempty instruction body.
@@ -51,6 +88,37 @@ Human-readable reports show decisions, evidence, measurements and output availab
 not filesystem paths. The CLI and machine-readable manifests/run records retain
 locations for retrieval and debugging. Setup or filesystem failures can prevent
 report creation; initialized runs preserve failure evidence where possible.
+
+## Architecture
+
+Zen is layered so both engines share one evaluation contract instead of each
+reimplementing case generation and judging.
+
+```mermaid
+flowchart LR
+   CLI["zen/cli.py<br/>commands, options, exit codes"] --> Domain["zen/domain/core.py<br/>Artifact, OptimizeConfig,<br/>BehaviorContract, Dataset"]
+   Domain --> Service["zen/optimization/service.py<br/>engine selection"]
+   Service --> Semantic["zen/optimization/semantic*.py<br/>draft-first workflow"]
+   Service --> GEPA["zen/optimization/proposer.py<br/>+ metric.py: GEPA search"]
+   Semantic --> Pipeline["zen/pipeline/<br/>synthesis, evaluation, gate"]
+   GEPA --> Pipeline
+   Pipeline --> Runtime["zen/runtime/<br/>lm.py, harness.py:<br/>isolated calls, caches, budgets"]
+   Runtime --> Report["zen/optimization/report.py<br/>report + manifest"]
+   Report --> CLI
+```
+
+| Layer | Files | Responsibility |
+| --- | --- | --- |
+| CLI | [zen/cli.py](../zen/cli.py) | Parses commands and options, wires the shared call budget, prints results and exit codes. |
+| Domain | [zen/domain/core.py](../zen/domain/core.py) | Shared vocabulary: `Artifact`, `OptimizeConfig`, `Dataset`, `BehaviorContract`/`Rule`, `CaseCategory`, `Aggregate`, `RunRecord`. Both engines read and write these same types. |
+| Runtime | [zen/runtime/lm.py](../zen/runtime/lm.py), [zen/runtime/harness.py](../zen/runtime/harness.py), [zen/runtime/progress.py](../zen/runtime/progress.py) | Isolated, tool-free model calls; a `ResponseCache` keyed on SHA-256(model + system + user + version); trial execution against the shared application-call budget; CLI progress reporting. |
+| Pipeline | [zen/pipeline/synthesis.py](../zen/pipeline/synthesis.py), [zen/pipeline/evaluation.py](../zen/pipeline/evaluation.py), [zen/pipeline/gate.py](../zen/pipeline/gate.py) | Shared by both engines: source-grounded case/contract generation with family-safe train/validation/holdout splitting, behavior and reader judgments, and trial-rate aggregation. |
+| Optimization | [zen/optimization/semantic.py](../zen/optimization/semantic.py) (with `semantic_checks.py`, `semantic_coverage.py`, `semantic_outputs.py`, `semantic_adjudication.py`), [zen/optimization/proposer.py](../zen/optimization/proposer.py), [zen/optimization/metric.py](../zen/optimization/metric.py) | Engine-specific orchestration: the semantic draft/review/repair/adjudication workflow, and the GEPA removal/rewrite proposer with its feedback metric. |
+| Reporting | [zen/optimization/service.py](../zen/optimization/service.py), [zen/optimization/report.py](../zen/optimization/report.py) | Dispatches to the selected engine and renders the human-readable report plus the machine-readable manifest. |
+
+The pipeline layer is the load-bearing shared contract: it is what lets a bounded
+semantic rewrite and a much larger GEPA search produce directly comparable
+VERIFIED/ACCEPTED evidence, using the same case generation, judging, and gating code.
 
 ## Commands and defaults
 
@@ -145,7 +213,8 @@ a response-only experiment.
 3. Review source and draft for concrete meaning changes. At most one repair addresses
    material instruction-review findings, followed by re-review; no score-search loop.
 4. Generate four source-based cases with `--quick`, or six normally, with equal
-   validation and holdout groups and representative/boundary tasks in each.
+   validation and holdout groups and representative/boundary tasks in each. Before
+   target answers, audit source requirements against these cases and report coverage.
 5. Obtain original/candidate answers and compare their task-relevant meaning.
    The candidate is frozen before holdout; holdout findings cannot train repairs.
 6. For complete but disputed evidence that meets the deterministic gates, run one
@@ -174,7 +243,8 @@ flowchart TD
    Defect -->|"No or review incomplete"| Freeze["Freeze candidate"]
    Repair --> Freeze
    Freeze --> Cases["Generate source-based validation and holdout cases"]
-   Cases --> Validation["Compare original and candidate answers: validation"]
+   Cases --> Audit["Audit source requirements and case coverage; no target answers"]
+   Audit --> Validation["Compare original and candidate answers: validation"]
    Validation --> Holdout["Compare original and candidate answers: holdout"]
    Holdout --> Gate{"Complete checks, no material loss, token and line gates met?"}
    Gate -->|Yes| Verified["VERIFIED"]
@@ -185,6 +255,7 @@ flowchart TD
    Resolved -->|Yes| Confirmed["CONFIRMED: model origin"]
    Resolved -->|"No, error or budget exhausted"| Required
    Cases -.->|"Generation fails"| Required
+   Audit -.->|"Audit fails"| Required
    Verified --> Publish["Integrity checks, optimized copy and report"]
    Confirmed --> Publish
    Required --> User["Show draft and report; offer user acceptance"]
@@ -197,7 +268,7 @@ or frozen candidate files block publication regardless of the displayed model ou
 ### Call budget and saved outputs
 
 Each structured request allows one schema retry; provider errors are never retried.
-Without retries or a repair, quick mode uses 15 calls and normal mode uses 21;
+Without retries or a repair, quick mode uses 16 calls and normal mode uses 22;
 one repair plus re-review adds two. Eligible disputed runs add one final-review call,
 with at most one schema retry. Passing runs do not need final adjudication. All of
 these calls share the default ceiling of 32 application calls,
@@ -212,6 +283,30 @@ On later source changes, Zen revokes this run's unchanged external candidate fil
 not another run's artifacts or user-edited outputs. Internal snapshots remain evidence.
 
 ### Semantic comparison
+
+Before target answers, one strong-model case audit inventories important source
+requirements, including conditions, exceptions, prohibitions and explicit language
+or public-format requirements. Each item includes an exact source quote, an explanation
+of whether response text can test it, and links to cases that exercise it. The audit
+receives only the source and generated cases, never the candidate or target answers.
+It does not regenerate cases or feed any candidate repair.
+
+Reports show coverage separately for validation and holdout:
+
+- **TESTED**: the model judges that a case scenario and its grading criteria exercise
+   the requirement. This does not mean an answer passed or the criteria are correct.
+- **UNTESTED**: no case in that phase is linked to the extracted requirement.
+- **NOT_TEXT_VERIFIABLE**: the model judges that response text cannot establish the
+   requirement, such as actual tool execution.
+
+The audit also flags unsupported or inapplicable grading criteria. Quotes and
+case/criterion references are checked mechanically; requirement interpretation,
+link relevance and inventory completeness remain model judgments. Coverage warnings
+are diagnostic, not new quality gates, and cannot override existing gates. Audit
+failure preserves the draft as REVIEW_REQUIRED and stops before target answers;
+one schema retry and no provider retries share the existing application-call budget.
+Run records retain the audit and its raw model response. These are not measured
+coverage guarantees or independent judgments.
 
 The reviewer compares actions, facts, constraints, exclusions, conditions, and task
 completion, rather than demanding identical words or response lengths. A short answer
@@ -515,6 +610,42 @@ cancellation, or output-write failure can leave no report.
 | 1 | `INCONCLUSIVE`, caught optimize setup/runtime failure, or failed selfcheck. |
 | 2 | Argument-parser error or unsupported/malformed artifact passed to detect. |
 | 130 | Keyboard interruption during optimization's handled execution. |
+
+## What makes Zen different
+
+Existing token-saving approaches generally fall into two groups, and Zen fits neither:
+
+- **Statistical prompt compressors** (perplexity/self-information pruning, generic
+  minifiers) shorten text using properties of language in general. They have no model
+  of what a specific `AGENTS.md` or `SKILL.md` is obligated to say, so they cannot tell
+  whether a dropped clause was redundant or load-bearing.
+- **Search-based prompt optimizers** usually need a labeled dataset of correct outputs
+  or a hand-written reward function to score candidates, and neither exists for an
+  arbitrary Copilot customization file.
+
+Zen instead:
+
+1. **Grounds evaluation in the artifact itself.** Cases and the requirement audit are
+   generated from the source's own quotes, exceptions, and constraints, not generic
+   fluency or length heuristics.
+2. **Judges relatively, not absolutely** (the RULER-influenced idea above): an original
+   and a candidate answer to the same case are compared against each other, which is
+   more reliable than asking a model to score either one in isolation, and needs no
+   labeled dataset.
+3. **Verifies before it takes credit for savings.** A smaller artifact alone never
+   passes; VERIFIED/ACCEPTED requires complete validation *and* holdout comparisons
+   with no observed material behavior loss, on top of the measured token reduction.
+4. **Keeps the source untouched and the draft inspectable.** Nothing is rewritten in
+   place; unverified drafts stay available for manual review instead of being discarded
+   or silently auto-applied.
+5. **Offers two budgets under one contract, not one fixed heuristic.** A cheap bounded
+   rewrite by default, and an opt-in deeper search (GEPA) when the extra call budget is
+   worth exploring more candidates, both judged by the same dataset-free,
+   source-grounded evidence.
+
+None of this proves universal equivalence, human reading-speed savings, or
+provider-billing reduction; see
+[UNCONFIRMED_ASSUMPTIONS.md](../UNCONFIRMED_ASSUMPTIONS.md) for the current limitations register.
 
 ## Limits and development
 
